@@ -12,7 +12,7 @@
   The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
 *********/
 
-const char version_string[] = "V1.14";
+const char version_string[] = "V1.15";
 
 #define MOTOR_1_PIN_1    14
 #define MOTOR_1_PIN_2    15
@@ -41,24 +41,10 @@ char roboter_name[34] = "cambot"; // only use a-z, 0-9 and - in the name
 char wifi_ssid[34] = WIFI_SSID;  // "REPLACE_WITH_YOUR_SSID";
 char wifi_password[66] = WIFI_PASSWORD; // "REPLACE_WITH_YOUR_PASSWORD";
 
-// =============================================================
-//  User-configurable channel list for scanning.
-//  Fill this with the channels you actually want to probe.
-//  Using non-overlapping channels (e.g. 1, 6, 11 or 1, 7, 13)
-//  keeps the scan short and the stream interruption minimal.
-//  Leave empty {} to scan ALL channels (slower).
-// =============================================================
-static const uint8_t ROAM_SCAN_CHANNELS[] = {}; //{1,2,3,4,5,6,7,8,9,10,11,12,13}; // { 1, 7, 13 };
-static const size_t  ROAM_SCAN_CHANNEL_COUNT =
-        sizeof(ROAM_SCAN_CHANNELS) / sizeof(ROAM_SCAN_CHANNELS[0]);
-
 #include "esp_camera.h"
 #include <WiFi.h>
 #include "esp_wifi.h"
-#include <WiFiMulti.h>
 #include <WiFiUdp.h>
-#include <lwip/sockets.h>
-#include <lwip/netdb.h>
 #include <DNSServer.h> // For captive portal
 #include <ESPmDNS.h>
 #include "esp_timer.h"
@@ -76,22 +62,27 @@ static const size_t  ROAM_SCAN_CHANNEL_COUNT =
 #include <string.h>
 #include <stdlib.h>
 #include <ctype.h>
-
-// =============================================================
-//  Detect whether 802.11r Fast Transition is compiled into
-//  this build. This is decided at compile time.
-// =============================================================
-#ifdef CONFIG_ESP_WIFI_11R_SUPPORT
-  #define ROAM_FT_AVAILABLE 1
-#else
-  #define ROAM_FT_AVAILABLE 0
-#endif
+#include <lwip/sockets.h>
+#include <lwip/inet.h>
 
 #define ENABLE_OTA 
 int OTA_Status = 0; // 0=not enabled, 1=enabled, 2=in progress
 DNSServer dnsServer;
 bool APMode = false;
-bool RoamForceTriggered = false;
+
+// Wi-Fi retry and health-check configuration.
+#define WIFI_INITIAL_CONNECT_MS       (1UL * 30UL * 1000UL)
+#define WIFI_RETRY_WINDOW_MS          (1UL * 30UL * 1000UL)
+#define WIFI_RETRY_BASE_MS            10000UL
+#define WIFI_RETRY_MAX_MS             30000UL
+#define WIFI_HEALTH_INTERVAL_MS       5000UL
+
+void wifiEventHandler(WiFiEvent_t event, WiFiEventInfo_t info);
+void wifiConnectionInit();
+void wifiRequestReconnect();
+void wifiConnectionTask();
+bool wifiStaHealthy();
+void startFallbackAP();
 
 
 IPAddress current_IP(192, 168, 4, 1);
@@ -101,8 +92,6 @@ int       current_channel = 0;
 int       current_rssi = -50;
 
 PwmThing MotorLeft, MotorRight, Servo1, Servo2, WhiteLED, RedLED;
-
-WiFiMulti wifiMulti;
 
 // Gamemaster stuff
 const unsigned int gmPort = 8071;        // UDP port for gamemaster
@@ -136,7 +125,7 @@ struct LightVariables {
   int Value = 0;                    // What the light is currently set to, timeouts and limits are applied to this value, and this is what is actually set on the LED
   int lowValue = 50;                // User defined value for candle/torch light (no time limit if below limitLowValue)
   int highValue = 255;              // User defined value for strong brightness (will be time limited)
-  int limitLowValue = 75;           // Unlimited brightness up to this value, above this value, the timeout will apply
+  int limitLowValue = 100;           // Unlimited brightness up to this value, above this value, the timeout will apply
   int limitHighValue = 250;         // Absolute maximum allowed brightness, even for boost, to prevent overheating
   int boostTime = 30000;            // Available boost time in milliseconds
   int boostTimeMax = 30000;         // Maximum boost time in milliseconds (e.g. to calculate remaining boost time percentage)
@@ -302,6 +291,16 @@ void loadLightServoLowHighVals() {
       file.close();
     }
   }
+  // If a file named limitLowValue.txt exists, read the value from it and overwrite the default LightVars.limitLowValue
+  if(filesystem.exists("/limitLowValue.txt")) {
+    File file = filesystem.open("/limitLowValue.txt", "r");
+    if(file) {
+      size_t len = file.readBytes(buffer, sizeof(buffer)-1);
+      buffer[len] = '\0';
+      sscanf(buffer, "%d", &LightVars.limitLowValue);
+      file.close();
+    }
+  }
 }
 
 void storeLightServoLowHighVals() {
@@ -315,7 +314,29 @@ httpd_handle_t stream_httpd = NULL;
 
 static esp_err_t index_handler(httpd_req_t *req)
 {
-  Serial.printf("Handling request for %s\n", req->uri);
+  char ip_str[INET6_ADDRSTRLEN] = "unknown";
+  struct sockaddr_storage peer_addr = {};
+  socklen_t peer_addr_len = sizeof(peer_addr);
+
+  int sockfd = httpd_req_to_sockfd(req);
+  if (lwip_getpeername(sockfd, (struct sockaddr *)&peer_addr, &peer_addr_len) == 0) {
+    if (peer_addr.ss_family == AF_INET) {
+      struct sockaddr_in *s = (struct sockaddr_in *)&peer_addr;
+      inet_ntop(AF_INET, &s->sin_addr, ip_str, sizeof(ip_str));
+    } else if (peer_addr.ss_family == AF_INET6) {
+      struct sockaddr_in6 *s = (struct sockaddr_in6 *)&peer_addr;
+      // IPv4-mapped IPv6 address (::ffff:a.b.c.d) -> extract IPv4 part
+      if (IN6_IS_ADDR_V4MAPPED(&s->sin6_addr)) {
+        struct in_addr ip4;
+        memcpy(&ip4, &s->sin6_addr.un.u32_addr[3], sizeof(ip4));
+        inet_ntop(AF_INET, &ip4, ip_str, sizeof(ip_str));
+      } else {
+        inet_ntop(AF_INET6, &s->sin6_addr, ip_str, sizeof(ip_str));
+      }
+    }
+  }
+
+  Serial.printf("Handling request for %s from %s\n", req->uri, ip_str);
 
   char filename[32] = {0,};
   const char *pData = NULL;
@@ -393,8 +414,8 @@ static esp_err_t info_handler(httpd_req_t *req){
   info_len += snprintf(info + info_len, sizeof(info) - info_len, "Version=\"%s\", ", version_string);
 
   char status[255] = "FPS: 12/30, Q:32, RSSI:-75";
-  snprintf(status, sizeof(status), "FPS:%d/%d, Q:%d, RSSI:%d, Ch:%d", fps, frame_limit_ms?1000/frame_limit_ms:0, 
-     quality, current_rssi, current_channel);
+  snprintf(status, sizeof(status), "FPS:%d/%d, Q:%d, RSSI:%d, Ch:%d, kBytes/s: %d, Command/s: %d", fps, frame_limit_ms?1000/frame_limit_ms:0, 
+     quality, current_rssi, current_channel, bps/1024, cps);
   info_len += snprintf(info + info_len, sizeof(info) - info_len, "Status=\"%s\", ", status);
   httpd_resp_set_type(req, "text/plain");
   return httpd_resp_send(req, info, strlen(info));
@@ -487,7 +508,7 @@ static esp_err_t cmd_handler(httpd_req_t *req){
         }
         if(key_values_changed[11]) { // servo1
           //Servo1.set(key_values[11]);
-          Servo1.startAnimation(2, 1000, Servo1.get(), key_values[11]);
+          Servo1.startAnimation(2, 500, Servo1.get(), key_values[11]);
         }
         if(key_values_changed[12]) { // servo2
           Servo2.set(key_values[12]);
@@ -681,11 +702,7 @@ static esp_err_t cmd_handler(httpd_req_t *req){
       if((httpd_query_key_value(buf, "reconnect", strbuf, sizeof(strbuf)) == ESP_OK)) {
         Serial.println("WiFi reconnect requested");
         httpd_resp_sendstr(req, "ok reconnecting triggered...");
-        WiFi.disconnect();
-        WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);      
-        WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL);  
-        //WiFi.reconnect();
-        wifiMulti.run();
+        wifiRequestReconnect();
         free(buf);
         return ESP_OK;
       }
@@ -710,7 +727,7 @@ static esp_err_t cmd_handler(httpd_req_t *req){
         httpd_resp_sendstr(req, "Triggered...");
         delay(100);
         free(buf);
-        RoamForceTriggered = true;
+        wifiRequestReconnect();
         return ESP_OK;
       }
     } else {
@@ -884,41 +901,36 @@ void setup() {
 
   loadLightServoLowHighVals();
 
-  // Wi-Fi connection
+  // Wi-Fi connection. The connection task keeps retrying without probing the gateway.
   WiFi.persistent(false);
-  //WiFi.config(INADDR_NONE, INADDR_NONE, INADDR_NONE, INADDR_NONE);
-  WiFi.setHostname(roboter_name); 
-  WiFi.mode(WIFI_STA);
-  WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
+  WiFi.setHostname(roboter_name);
+  WiFi.setSleep(false);
   WiFi.setAutoReconnect(true);
-  wifiMulti.addAP(wifi_ssid, wifi_password);
-  WhiteLED.set(32); // LED on
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+  WiFi.onEvent(wifiEventHandler);
+  WhiteLED.startAnimation(1, 200, 0, 32);
   Serial.printf("Connecting to WiFi SSID: %s\n", wifi_ssid);
+  wifiConnectionInit();
+  uint32_t initialConnectStart = millis();
+  while (!wifiStaHealthy() && (millis() - initialConnectStart < WIFI_INITIAL_CONNECT_MS)) {
+    wifiConnectionTask();
+    RedLED.doAnimation();
+    WhiteLED.doAnimation();
+    delay(20);
+  }
 
-  if(wifiMulti.run() != WL_CONNECTED) {
-    Serial.println("Failed to connect to WiFi, opening AP mode.");
-    RedLED.set(255); // Red LED on to indicate WiFi connection failure
-    wifiMulti.APlistClean(); WiFi.disconnect(true, true); delay(1000); 
-    WiFi.AP.begin();
-    WiFi.AP.create(roboter_name);
-    WiFi.AP.enableDhcpCaptivePortal();
-    APMode = true;
-    RedLED.startAnimation(1, 500); // Fast breathing red to indicate AP mode
-
-    // by default DNSServer is started serving any "*" domain name. It will reply
-    // AccessPoint's IP to all DNS request (this is required for Captive Portal detection)
-    dnsServer.setErrorReplyCode(DNSReplyCode::NoError);
-    dnsServer.start(53, "*", WiFi.softAPIP());
-
-    current_IP = WiFi.softAPIP();
+  if (!wifiStaHealthy()) {
+    Serial.println("WiFi connection effort exhausted; opening AP+STA mode.");
+    RedLED.set(255);
+    startFallbackAP();
   } else {
+    APMode = false;
     current_IP = WiFi.localIP();
-    strcpy(current_ssid, WiFi.SSID().c_str());
-    RedLED.startAnimation(1, 4000); // Slow breathing red to indicate successful WiFi connection
+    strlcpy(current_ssid, wifi_ssid, sizeof(current_ssid));
+    RedLED.startAnimation(1, 4000);
   }
   //esp_wifi_set_max_tx_power(40);
 
-  WiFi.setSleep(false);
   Serial.printf("\nWiFi connected. Camera Stream Ready! Go to: http://%s or http://%s.local\n", current_IP.toString().c_str(), roboter_name);
   MDNS.begin(roboter_name);
   MDNS.addService("_http", "_tcp", 80);
@@ -1230,336 +1242,152 @@ void powerDown() {
   esp_deep_sleep_start();
 }
 
-int WiFiScanState = 0; // 0 = idle, 1 = scanning, 2 = scan done
+// Wi-Fi connection state machine. It validates association and DHCP locally;
+// it never opens a TCP or ICMP connection to the gateway.
 
+static uint32_t wifiNextAttemptMs = 0;
+static uint32_t wifiRetryStartedMs = 0;
+static uint32_t wifiLastHealthMs = 0;
+static uint32_t wifiRetryDelayMs = WIFI_RETRY_BASE_MS;
+static uint8_t wifiRetryCount = 0;
+static bool wifiScanFound = false;
+static volatile bool wifiGotIpEvent = false;
+static volatile bool wifiLostIpEvent = false;
+static volatile bool wifiDisconnectedEvent = false;
 
-
-/**
- * ROAMING DOES NOT WORK YET FOR WHATEVER REASON...
- * Call this cyclically from loop().
- *
- * @param forceScan  true  => start a scan immediately (if none running)
- *                   false => scan only when RSSI < SCAN_RSSI_THRESHOLD
- *                            and the SCAN_INTERVAL has elapsed.
- * @return true if a roaming switch or a hard reconnect was triggered.
- *
- * Behaviour:
- *  - Scans only the channels listed in ROAM_SCAN_CHANNELS (custom
- *    single-channel async scans chained together) to minimise airtime.
- *  - If a same-SSID AP is HYSTERESIS_DB stronger, it reassociates to it
- *    keeping the IP / DHCP lease (fast roam). Uses 802.11r FT if available.
- *  - A gateway-reachability watchdog runs in parallel. If the default
- *    gateway is unreachable for GW_FAIL_TIMEOUT_MS, a full "hard" reconnect
- *    is performed (full scan, fresh DHCP, radio re-init).
- */
-bool wifiRoamTask(bool forceScan) {
-    // ---------------- Configuration ----------------
-    constexpr int8_t   SCAN_RSSI_THRESHOLD = -75;   // dBm
-    constexpr int8_t   HYSTERESIS_DB       = 12;    // dB better required
-    constexpr uint32_t SCAN_INTERVAL_MS    = 30000; // 30 s between auto-scans
-    constexpr uint32_t SWITCH_COOLDOWN_MS  = 10000; // calm period after a roam
-    constexpr uint32_t PER_CHANNEL_MS      = 300;   // dwell time per channel
-
-    // Watchdog config
-    constexpr uint32_t GW_PING_INTERVAL_MS = 10000;  // how often to probe GW
-    constexpr uint32_t GW_FAIL_TIMEOUT_MS  = 30000;  // unreachable -> hard reset
-    constexpr uint16_t GW_PROBE_PORT       = 80;    // TCP SYN target port
-
-    // ---------------- Scan state machine ----------------
-    enum ScanState { SCAN_IDLE, SCAN_RUNNING };
-    static ScanState scanState   = SCAN_IDLE;
-    static uint32_t  lastScanMs   = 0;
-    static uint32_t  lastSwitchMs = 0;
-    static size_t    chanIdx      = 0;   // index into ROAM_SCAN_CHANNELS
-
-    // Accumulated best candidate across the per-channel scans
-    static int       bestRssiAcc  = -128;
-    static uint8_t   bestBssidAcc[6];
-    static int32_t   bestChanAcc  = 0;
-    static bool      candidateFound = false;
-
-    // ---------------- Watchdog state ----------------
-    static uint32_t  lastGwOkMs    = 0;
-    static uint32_t  lastGwProbeMs = 0;
-
-    const uint32_t now = millis();
-
-    // =====================================================
-    // 0) If not connected, let the (hard) reconnect logic
-    //    handle it. Abort any running scan cleanly.
-    // =====================================================
-    if (WiFi.status() != WL_CONNECTED) {
-        if (scanState == SCAN_RUNNING) {
-            WiFi.scanDelete();
-            scanState = SCAN_IDLE;
-        }
-        // Reset watchdog timer so we don't immediately hard-reset again.
-        //lastGwOkMs = now;
-        //return false;
-        lastGwProbeMs = now; // Don't ping, but try reconnect
+void wifiEventHandler(WiFiEvent_t event, WiFiEventInfo_t info) {
+  if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+    wifiDisconnectedEvent = true;
+    uint8_t reason = info.wifi_sta_disconnected.reason;
+    Serial.printf("WiFi disconnected, reason=%u", reason);
+    switch (reason) {
+      case WIFI_REASON_AUTH_EXPIRE: Serial.println(" (AUTH_EXPIRE)"); break;
+      case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT: Serial.println(" (4WAY_HANDSHAKE_TIMEOUT)"); break;
+      case WIFI_REASON_NO_AP_FOUND: Serial.println(" (NO_AP_FOUND)"); break;
+      default: Serial.println(); break;
     }
+  } else if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
+    wifiGotIpEvent = true;
+    Serial.printf("WiFi got IP: %s\n", WiFi.localIP().toString().c_str());
+  } else if (event == ARDUINO_EVENT_WIFI_STA_LOST_IP) {
+    wifiLostIpEvent = true;
+    Serial.println("WiFi lost IP");
+  }
+}
 
-    // =====================================================
-    // 1) Gateway watchdog (non-blocking TCP SYN probe)
-    // =====================================================
-    if (lastGwOkMs == 0) lastGwOkMs = now;   // init on first connected call
+bool wifiStaHealthy() {
+  wifi_ap_record_t apInfo = {};
+  IPAddress ip = WiFi.localIP();
+  return WiFi.status() == WL_CONNECTED && WiFi.RSSI() != 0 &&
+         esp_wifi_sta_get_ap_info(&apInfo) == ESP_OK &&
+         ip != IPAddress(0, 0, 0, 0);
+}
 
-    if (now - lastGwProbeMs >= GW_PING_INTERVAL_MS) {
-        lastGwProbeMs = now;
-
-        IPAddress gw = WiFi.gatewayIP();
-        if (gw != IPAddress(0, 0, 0, 0)) {
-            // Non-blocking connect attempt to the gateway.
-            int s = lwip_socket(AF_INET, SOCK_STREAM, 0);
-            if (s >= 0) {
-                // set non-blocking
-                int flags = lwip_fcntl(s, F_GETFL, 0);
-                lwip_fcntl(s, F_SETFL, flags | O_NONBLOCK);
-
-                struct sockaddr_in addr = {};
-                addr.sin_family = AF_INET;
-                addr.sin_port   = htons(GW_PROBE_PORT);
-                addr.sin_addr.s_addr = (uint32_t)gw;
-
-                lwip_connect(s, (struct sockaddr*)&addr, sizeof(addr));
-
-                // Quick select to see if it connects (or gets refused,
-                // which still proves L3 reachability).
-                fd_set wset, eset;
-                FD_ZERO(&wset); FD_ZERO(&eset);
-                FD_SET(s, &wset); FD_SET(s, &eset);
-                struct timeval tv = { 0, 200000 }; // 200 ms max
-                int r = lwip_select(s + 1, NULL, &wset, &eset, &tv);
-
-                bool reachable = false;
-                if (r > 0) {
-                    // Either connected or RST received => host is alive.
-                    int err = 0; socklen_t len = sizeof(err);
-                    lwip_getsockopt(s, SOL_SOCKET, SO_ERROR, &err, &len);
-                    // ECONNREFUSED also means the gateway answered.
-                    if (err == 0 || err == ECONNREFUSED) reachable = true;
-                }
-                lwip_close(s);
-
-                if (reachable) lastGwOkMs = now; else
-                  Serial.printf("Gateway probe: %sreachable (r=%d, err=%d)\n",
-                      reachable ? "" : "NOT ", r, errno);
-            }
-        } else {
-            // No gateway known yet -> treat as ok to avoid false resets.
-            lastGwOkMs = now;
-        }
+bool wifiScanForConfiguredSsid() {
+  int n = WiFi.scanNetworks(false, true);
+  wifiScanFound = false;
+  if (n > 0) {
+    for (int i = 0; i < n; ++i) {
+      if (strcmp(WiFi.SSID(i).c_str(), wifi_ssid) == 0) {
+        wifiScanFound = true;
+              Serial.printf("Configured SSID found: ch=%d rssi=%d auth=%d\n",
+                    WiFi.channel(i), WiFi.RSSI(i), (int)WiFi.encryptionType(i));
+        break;
+      }
     }
+  }
+  WiFi.scanDelete();
+  return wifiScanFound;
+}
 
-    // Watchdog tripped -> hard reconnect (slow but robust)
-    if (now - lastGwOkMs >= GW_FAIL_TIMEOUT_MS) {
-        Serial.printf("Gateway unreachable for %lu ms -> hard reconnect",
-              (unsigned long)(now - lastGwOkMs));
+void wifiBeginAttempt() {
+  uint32_t now = millis();
+  if (now < wifiNextAttemptMs) return;
+  wifiRetryCount++;
+  RedLED.startAnimation(1, 200);
+  Serial.printf("WiFi attempt %u: scanning for SSID %s\n", wifiRetryCount, wifi_ssid);
+  if (wifiScanForConfiguredSsid()) {
+    WiFi.setMinSecurity(WIFI_AUTH_WPA_PSK);
+    esp_wifi_set_country_code("DE", true);
+    Serial.println("Configured SSID found; starting STA association");
+    WiFi.begin(wifi_ssid, wifi_password);
+  } else {
+    Serial.println("Configured SSID not found; retrying after backoff");
+  }
+  wifiNextAttemptMs = now + wifiRetryDelayMs;
+  if (wifiRetryDelayMs < WIFI_RETRY_MAX_MS) wifiRetryDelayMs *= 2;
+  if (wifiRetryDelayMs > WIFI_RETRY_MAX_MS) wifiRetryDelayMs = WIFI_RETRY_MAX_MS;
+}
 
-        if (scanState == SCAN_RUNNING) {
-            WiFi.scanDelete();
-            scanState = SCAN_IDLE;
+void wifiConnectionInit() {
+  WiFi.mode(APMode ? WIFI_AP_STA : WIFI_STA);
+   // Accept also WPA/WPA2 mixed and WPA-TKIP access points (default in core 3.x is WPA2_PSK)
+  WiFi.setMinSecurity(WIFI_AUTH_WPA_PSK);   // use WIFI_AUTH_OPEN for open networks
+  WiFi.disconnect(true, false);
+  delay(50);
+  WiFi.setSleep(false);
+  WiFi.setAutoReconnect(true);
+  wifiRetryStartedMs = millis();
+  wifiRetryDelayMs = WIFI_RETRY_BASE_MS;
+  wifiRetryCount = 0;
+  wifiNextAttemptMs = 0;
+  wifiBeginAttempt();
+}
+
+void wifiRequestReconnect() {
+  Serial.println("WiFi reconnect requested");
+  wifiConnectionInit();
+}
+
+void startFallbackAP() {
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.AP.begin();
+  WiFi.AP.create(roboter_name);
+  WiFi.AP.enableDhcpCaptivePortal();
+  APMode = true;
+  RedLED.startAnimation(1, 500);
+  dnsServer.setErrorReplyCode(DNSReplyCode::NoError);
+  dnsServer.start(53, "*", WiFi.softAPIP());
+  current_IP = WiFi.softAPIP();
+  wifiRetryStartedMs = millis();
+  wifiNextAttemptMs = 0;
+  wifiRetryDelayMs = WIFI_RETRY_BASE_MS;
+  Serial.printf("Fallback AP started at %s; STA retries continue in background\n", current_IP.toString().c_str());
+}
+
+void wifiConnectionTask() {
+  uint32_t now = millis();
+  if (wifiDisconnectedEvent) {
+    wifiDisconnectedEvent = false;
+    wifiBeginAttempt();
+  }
+  if (wifiGotIpEvent || wifiLostIpEvent) {
+    wifiGotIpEvent = false;
+    wifiLostIpEvent = false;
+  }
+  if (now - wifiLastHealthMs >= WIFI_HEALTH_INTERVAL_MS) {
+      wifiLastHealthMs = now;  
+      if (wifiStaHealthy()) {
+        current_IP = WiFi.localIP();
+        strlcpy(current_ssid, wifi_ssid, sizeof(current_ssid));
+        // Serial.printf("WiFi health OK: RSSI=%d, IP=%s\n", WiFi.RSSI(), current_IP.toString().c_str());
+        wifiNextAttemptMs = now + wifiRetryDelayMs;
+        if (APMode) {
+          APMode = false;
+          dnsServer.stop();
+          WiFi.mode(WIFI_STA);
+          current_IP = WiFi.localIP();
+          RedLED.startAnimation(1, 4000);
+          Serial.println("STA recovered; leaving fallback AP");
         }
-
-        // Tear everything down, re-init the radio, fresh DHCP, full scan.
-        WiFi.persistent(false);
-        WiFi.disconnect(true, true);     // disconnect + erase config
-        WiFi.mode(WIFI_OFF);
-        delay(50);
-        esp_wifi_stop();                 // stop driver -> radio recalibration
-        delay(50);
-        esp_wifi_start();
-        WiFi.mode(WIFI_STA);
-        WiFi.setAutoReconnect(true);
-
-        // Reconnect using the stored SSID/password from NVS or your globals.
-        WiFi.begin(wifi_ssid, wifi_password);   // full scan + fresh DHCP
-
-        lastGwOkMs    = now;   // reset watchdog window
-        lastSwitchMs  = now;
-        lastScanMs    = now;
-        return true;
-    }
-
-    // =====================================================
-    // 2) Scan trigger logic
-    // =====================================================
-    if (scanState == SCAN_IDLE &&
-        (now - lastSwitchMs > SWITCH_COOLDOWN_MS)) {
-
-        bool startScan = false;
-        if (forceScan) {
-            startScan = true;
-        } else if ((now - lastScanMs) >= SCAN_INTERVAL_MS) {
-            if (WiFi.RSSI() < SCAN_RSSI_THRESHOLD) {
-                startScan = true;
-            } else {
-                lastScanMs = now;   // RSSI fine, just reset the tick
-            }
+      } else {
+        if(!APMode) {
+          Serial.println("WiFi health check failed; STA not healthy");
+          if (now >= wifiNextAttemptMs) wifiBeginAttempt();
+          // if (!APMode && now - wifiRetryStartedMs >= WIFI_RETRY_WINDOW_MS) startFallbackAP();
         }
-
-        if (startScan) {
-            // Reset accumulators and start scanning the first channel.
-            chanIdx        = 0;
-            bestRssiAcc    = WiFi.RSSI() + HYSTERESIS_DB; // must be beaten
-            candidateFound = false;
-            lastScanMs     = now;
-
-            if (ROAM_SCAN_CHANNEL_COUNT == 0) {
-                // No list given -> scan all channels in one async scan.
-                WiFi.scanNetworks(true, false, false, PER_CHANNEL_MS, 0);
-                Serial.printf("Starting full async scan (all channels, %d ms dwell)\n", PER_CHANNEL_MS);
-            } else {
-                // Start with the first channel from our list.
-                WiFi.scanNetworks(true, false, false, PER_CHANNEL_MS,
-                                  ROAM_SCAN_CHANNELS[chanIdx]);
-                Serial.printf("Starting async scan on channel %d (dwell %d ms)\n", ROAM_SCAN_CHANNELS[chanIdx], PER_CHANNEL_MS);
-            }
-            scanState = SCAN_RUNNING;
-        }
-    }
-
-    // =====================================================
-    // 3) Scan result handling (per-channel chaining)
-    // =====================================================
-    if (scanState == SCAN_RUNNING) {
-        int n = WiFi.scanComplete();
-        
-        if (n == WIFI_SCAN_RUNNING) return false;   // -1: still scanning
-
-        if (n == WIFI_SCAN_FAILED) {                // -2: start failed/busy
-            // The driver rejected the scan (often busy with the video
-            // stream). Clean up and RETRY the SAME channel next call,
-            // do NOT advance chanIdx.
-            static uint8_t failRetries = 0;
-            WiFi.scanDelete();
-
-            if (++failRetries >= 5) {
-                // Give up this scan round to avoid an infinite stall.
-                Serial.println("Scan kept failing -> aborting scan round");
-                failRetries = 0;
-                scanState   = SCAN_IDLE;
-                lastScanMs  = now;          // back off until next interval
-                return false;
-            }
-
-            // Re-arm the same channel.
-            int16_t ret = WiFi.scanNetworks(
-                true, false, false, PER_CHANNEL_MS,
-                (ROAM_SCAN_CHANNEL_COUNT > 0) ? ROAM_SCAN_CHANNELS[chanIdx] : 0);
-            Serial.printf("Scan retry ch=%d ret=%d (try %u)\n",
-                (ROAM_SCAN_CHANNEL_COUNT > 0) ? ROAM_SCAN_CHANNELS[chanIdx] : 0,
-                ret, failRetries);
-            return false;
-        }
-
-        // n >= 0: results available -> evaluate this channel.
-        if (n >= 0) {
-            const String   curSsid  = WiFi.SSID();
-            const uint8_t* curBssid = WiFi.BSSID();
-            Serial.printf("Scan result: n=%d, ch=%d\n", n, ROAM_SCAN_CHANNELS[chanIdx]);
-
-            for (int i = 0; i < n; ++i) {
-                if (WiFi.SSID(i) != curSsid)                 continue;
-                if (memcmp(WiFi.BSSID(i), curBssid, 6) == 0) continue;
-                int8_t r = WiFi.RSSI(i);
-                if (r > bestRssiAcc) {
-                    bestRssiAcc = r;
-                    memcpy(bestBssidAcc, WiFi.BSSID(i), 6);
-                    bestChanAcc = WiFi.channel(i);
-                    candidateFound = true;
-                }
-            }
-        }
-        WiFi.scanDelete();
-
-        // Advance to next channel and CHECK the start return value.
-        bool moreChannels = false;
-        if (ROAM_SCAN_CHANNEL_COUNT > 0) {
-            chanIdx++;
-            if (chanIdx < ROAM_SCAN_CHANNEL_COUNT) {
-                int16_t ret = WiFi.scanNetworks(
-                    true, false, false, PER_CHANNEL_MS,
-                    ROAM_SCAN_CHANNELS[chanIdx]);
-                if (ret == WIFI_SCAN_FAILED) {
-                    // Stay in SCAN_RUNNING; the -2 branch above will
-                    // retry this channel on the next call.
-                    Serial.printf("Next-channel scan start failed ch=%d\n",
-                                  ROAM_SCAN_CHANNELS[chanIdx]);
-                }
-                moreChannels = true;   // keep SCAN_RUNNING either way
-            }
-        }
-
-        if (moreChannels) return false;
-
-        // ---- All requested channels scanned: decide on roaming ----
-        scanState = SCAN_IDLE;
-
-        Serial.printf("Scan done. %sandidate found. CH: %d\n", candidateFound ? " C":"No c", bestChanAcc);
-
-        if (candidateFound) {
-            wifi_config_t cfg = {};
-            esp_wifi_get_config(WIFI_IF_STA, &cfg);
-            memcpy(cfg.sta.bssid, bestBssidAcc, 6);
-            cfg.sta.bssid_set = true;
-            cfg.sta.channel   = (uint8_t)bestChanAcc;
-
-        #if ROAM_FT_AVAILABLE
-            cfg.sta.rm_enabled  = true;
-            cfg.sta.btm_enabled = true;
-            cfg.sta.ft_enabled  = true;
-        #endif
-
-            // Disconnect first - ESP32 WiFi stack ignores bssid_set on already-connected STA
-            esp_wifi_disconnect();
-
-            // Small delay to let the stack process the disconnect cleanly
-            vTaskDelay(pdMS_TO_TICKS(100));
-
-            esp_wifi_set_config(WIFI_IF_STA, &cfg);
-
-            esp_err_t err = esp_wifi_connect();
-            if (err == ESP_OK) {
-                lastSwitchMs = now;
-
-                // Wait for actual connection and verify target BSSID was reached
-                uint32_t waitStart = millis();
-                bool connected = false;
-                while (millis() - waitStart < 5000) {
-                    if (WiFi.status() == WL_CONNECTED) {
-                        connected = true;
-                        break;
-                    }
-                    vTaskDelay(pdMS_TO_TICKS(100));
-                }
-
-                if (connected) {
-                    // Use esp_wifi_sta_get_ap_info() - more reliable than WiFi.BSSIDstr()
-                    wifi_ap_record_t apInfo;
-                    if (esp_wifi_sta_get_ap_info(&apInfo) == ESP_OK) {
-                        bool bssidMatch = (memcmp(apInfo.bssid, bestBssidAcc, 6) == 0);
-                        Serial.printf("Roam -> %02X:%02X:%02X:%02X:%02X:%02X "
-                                      "ch %ld RSSI %d (FT=%d) BSSIDmatch=%d\n",
-                                      apInfo.bssid[0], apInfo.bssid[1], apInfo.bssid[2],
-                                      apInfo.bssid[3], apInfo.bssid[4], apInfo.bssid[5],
-                                      (long)bestChanAcc, apInfo.rssi,
-                                      ROAM_FT_AVAILABLE, bssidMatch);
-                    }
-                } else {
-                    Serial.println("Roam: connect timeout, reverting bssid_set=false");
-                    // Fallback: let ESP32 choose AP freely again
-                    cfg.sta.bssid_set = false;
-                    esp_wifi_set_config(WIFI_IF_STA, &cfg);
-                    esp_wifi_connect();
-                }
-                return connected;
-            }
-        }
-
-    }
-
-    return false;
+      }
+  }
 }
 
 void processSerial() {
@@ -1602,12 +1430,13 @@ void processSerial() {
         writeFile("/wifi_password.txt", wifi_password);
         Serial.printf("Updated WiFi password to: %s\n", wifi_password);
       } else if(strncmp(inputBuffer, "scan", 4) == 0) {
-        RoamForceTriggered = true; // Trigger WiFi scan/roam in main loop
+        wifiRequestReconnect();
       } else if(strncmp(inputBuffer, "off", 3) == 0) {
         powerDown();        
       } else if(strncmp(inputBuffer, "t1", 2) == 0) {
         camera_config_t config;     
         sensor_t * s = esp_camera_sensor_get();   
+        writeFile("/limitLowValue.txt", "255");
       } else if(strncmp(inputBuffer, "reboot", 6) == 0) {
         Serial.println("Rebooting...");
         delay(100);
@@ -1778,10 +1607,7 @@ void loop() {
   processSerial(); // Check for serial commands 
   handleGmUdp();
 
-  if(!APMode) {
-    wifiRoamTask(RoamForceTriggered); // Check if we should roam to a better AP
-    RoamForceTriggered = false; // Reset roam trigger after handling
-  }
+  wifiConnectionTask();
 
   delay(10);
 }

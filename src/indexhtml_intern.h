@@ -740,7 +740,7 @@ static const char PROGMEM INDEX_HTML[] = R"rawliteral(
   };
 
   /* ── Network send ── */
-  const UPDATE_INTERVAL = 50;
+  const UPDATE_INTERVAL = 100;
   let lastSendTime  = 0;
   let retryTimeout  = null;
 
